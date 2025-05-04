@@ -1,53 +1,139 @@
-# decompyle3 version 3.9.0
-# Python bytecode version base 3.7.0 (3394)
-# Decompiled from: Python 3.11.5 (tags/v3.11.5:cce6ba9, Aug 24 2023, 14:31:22) [MSC v.1936 64 bit (AMD64)]
-# Source filename: pyc2bytecode.py
+# Note: This script only works for Python 3.12 .pyc files.
+# Output files will be created in the same directory as the input .pyc file, with output filenames based on the input filename.
 
-import argparse, marshal, os, struct, sys, types
-from collections import namedtuple
+import sys
+import marshal
+import dis
+import io
+import os
+import asyncio
+import aiohttp
 
-def convert_to_bytecode(code):
-    if isinstance(code, types.CodeType):
-        return code
-    return marshal.loads(code)
+# --- OpenRouter API config (referenced from ocr_thread.py) ---
+API_KEY = "YOUR-API-KEY-HERE"  # Replace with your OpenRouter API key
+# Note: You can set this as an environment variable instead of hardcoding it.
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+LLM_MODEL = "google/gemini-2.0-flash-001"
+# Improved prompt for better decompilation and asm meaning preservation
+DECOMPILE_PROMPT = (
+    "You are given Python 3.12 pyc disassembled bytecode below.\n"
+    "Your task is to decompile it into a readable Python script that is as close as possible in logic and structure to the original bytecode (i.e., preserve the meaning and flow as seen in the assembly instructions).\n"
+    "Do not add extra explanations, comments, or modifications beyond what is necessary to faithfully represent the bytecode logic in Python.\n"
+    "After the code block, provide a step-by-step explanation of your decompilation process and highlight any key improvements or important points.\n"
+    "\n"
+    "{Input}"
+)
 
+async def call_openrouter_llm(api_key, prompt):
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+    }
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(OPENROUTER_API_URL, headers=headers, json=payload) as response:
+            if response.status == 200:
+                result = await response.json()
+                return result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            else:
+                error_text = await response.text()
+                print(f"OpenRouter API error: {response.status} - {error_text}")
+                return None
 
-def create_argparser():
-    parser = argparse.ArgumentParser(description='Convert .pyc file to .pyo file')
-    parser.add_argument('pyc_file', help='The .pyc file to convert')
-    parser.add_argument('-o', '--output', help='The output file name')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
-    return parser
+def dump_dis_to_bin(code, bin_path):
+    # Dump disassembled bytecode to a .bin file
+    with io.StringIO() as buf:
+        dis.dis(code, file=buf)
+        asm_output = buf.getvalue()
+    with open(bin_path, "w", encoding="utf-8") as f:
+        f.write(asm_output)
+    return asm_output
 
+async def main():
+    if len(sys.argv) != 2:
+        print("Usage: python pyc2bytecode.py <file.pyc>")
+        sys.exit(1)
+    pyc_path = sys.argv[1]
+    with open(pyc_path, "rb") as f:
+        data = f.read()
+    code = marshal.loads(data[16:])
+    print(repr(code))
+    print("Raw bytecode:", code.co_code)
+    print("Disassembled (asm-like):")
+    dis.dis(code)
 
-def main():
-    parser = create_argparser()
-    args = parser.parse_args()
-    pyc_file = args.pyc_file
-    output_file = args.output
-    verbose = args.verbose
-    if not os.path.exists(pyc_file):
-        print('Error: {} does not exist'.format(pyc_file))
-        return
-    if verbose:
-        print('Converting {} to bytecode'.format(pyc_file))
-    with open(pyc_file, 'rb') as f:
-        magic = f.read(4)
-        moddate = f.read(4)
-        if verbose:
-            print('Magic: {}'.format(magic))
-            print('Moddate: {}'.format(moddate))
-        code = marshal.load(f)
-        bytecode = convert_to_bytecode(code)
-        if output_file is None:
-            output_file = os.path.splitext(pyc_file)[0] + '.pyo'
-        with open(output_file, 'wb') as fw:
-            fw.write(magic)
-            fw.write(moddate)
-            marshal.dump(bytecode, fw)
-            if verbose:
-                print('Successfully converted {} to {}'.format(pyc_file, output_file))
+    # Dump disassembled bytecode to .bin file
+    bin_path = pyc_path.rsplit('.', 1)[0] + ".bin"
+    asm_output = dump_dis_to_bin(code, bin_path)
+    print(f"Disassembly written to {bin_path}")
 
+    # Read .bin content to send to LLM
+    with open(bin_path, "r", encoding="utf-8") as f:
+        bin_content = f.read()
+    # Add explain step and key improvement request to the prompt
+    prompt = (
+        "This is python 3.12 pyc byte code , i want you read all byte code and decompile to readable python script that close meaning to assembly pyc code\n"
+        "After decompiling, please explain step by step how you did it and highlight key improvements or important points in the decompiled code.\n"
+        "{Input}"
+    ).replace("{Input}", bin_content)
+    print("Sending to OpenRouter LLM for decompilation...")
+    llm_result = await call_openrouter_llm(API_KEY, prompt)
+    if llm_result:
+        print("\n--- LLM Decompile Result ---\n")
+        print(llm_result)
+        # Output files will be named based on the input file
+        base_name = os.path.splitext(os.path.basename(pyc_path))[0]
+        code_path = os.path.join(os.path.dirname(pyc_path), f"{base_name}_LLM.py")
+        readme_path = os.path.join(os.path.dirname(pyc_path), f"{base_name}_LLM_readme.md")
+        is_code = False
+        code_content = ""
+        readme_content = ""
+        llm_stripped = llm_result.strip()
+        if llm_stripped.startswith("```python"):
+            code_content = llm_stripped.split("```python",1)[1].rsplit("```",1)[0].strip()
+            is_code = True
+            # Extract explanation after code block if present
+            after_code = llm_stripped.split("```python",1)[1].rsplit("```",1)
+            if len(after_code) > 1:
+                readme_content = after_code[1].strip()
+        elif llm_stripped.startswith("```"):
+            code_content = llm_stripped.split("```",1)[1].rsplit("```",1)[0].strip()
+            is_code = True
+            after_code = llm_stripped.split("```",1)[1].rsplit("```",1)
+            if len(after_code) > 1:
+                readme_content = after_code[1].strip()
+        elif llm_stripped.startswith("def ") or llm_stripped.startswith("class ") or llm_stripped.startswith("import "):
+            code_content = llm_stripped
+            is_code = True
 
-if __name__ == '__main__':
-    main()
+        if is_code and code_content:
+            with open(code_path, "w", encoding="utf-8") as f:
+                f.write(code_content)
+            print(f"Python code written to {code_path}")
+            # If there is explanation after code, write it to readme
+            if readme_content:
+                with open(readme_path, "w", encoding="utf-8") as f:
+                    f.write(readme_content)
+                print(f"Explanation written to {readme_path}")
+        elif not is_code:
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write(llm_stripped)
+            print(f"Other content written to {readme_path}")
+    else:
+        print("Failed to get response from OpenRouter LLM.")
+
+if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
